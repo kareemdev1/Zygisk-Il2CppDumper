@@ -46,6 +46,10 @@ std::string GetLibDir(JavaVM *vms) {
         if (currentApplicationId) {
             jobject application = env->CallStaticObjectMethod(activity_thread_clz,
                                                               currentApplicationId);
+            if (application == nullptr) {
+                LOGE("currentApplication returned null");
+                return {};
+            }
             jclass application_clazz = env->GetObjectClass(application);
             if (application_clazz) {
                 jmethodID get_application_info = env->GetMethodID(application_clazz,
@@ -111,22 +115,63 @@ struct NativeBridgeCallbacks {
     void *(*loadLibraryExt)(const char *libpath, int flag, void *ns);
 };
 
-bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    //TODO 等待houdini初始化
-    sleep(5);
-
-    auto libart = dlopen("libart.so", RTLD_NOW);
-    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
-                                                                             "JNI_GetCreatedJavaVMs");
+// Poll (bounded) until a JavaVM exists and ActivityThread.currentApplication() is non-null,
+// signalling the native bridge (houdini) is up. Replaces a fixed sleep. Returns the VM, or
+// nullptr on timeout.
+static JavaVM *WaitForRuntime(void *libart) {
+    auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(
+            libart, "JNI_GetCreatedJavaVMs");
     LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
-    JavaVM *vms_buf[1];
-    JavaVM *vms;
-    jsize num_vms;
-    jint status = JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms);
-    if (status == JNI_OK && num_vms > 0) {
-        vms = vms_buf[0];
-    } else {
-        LOGE("GetCreatedJavaVMs error");
+    if (!JNI_GetCreatedJavaVMs) {
+        LOGE("dlsym JNI_GetCreatedJavaVMs failed");
+        return nullptr;
+    }
+    for (int i = 0; i < 300; i++) { // up to ~30s at 100ms per iteration
+        JavaVM *vms_buf[1];
+        jsize num_vms = 0;
+        if (JNI_GetCreatedJavaVMs(vms_buf, 1, &num_vms) == JNI_OK && num_vms > 0) {
+            JavaVM *vms = vms_buf[0];
+            JNIEnv *env = nullptr;
+            if (vms->AttachCurrentThread(&env, nullptr) == JNI_OK && env != nullptr) {
+                bool ready = false;
+                jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
+                if (activity_thread_clz != nullptr) {
+                    jmethodID currentApplicationId = env->GetStaticMethodID(
+                            activity_thread_clz, "currentApplication",
+                            "()Landroid/app/Application;");
+                    if (currentApplicationId) {
+                        jobject application = env->CallStaticObjectMethod(
+                                activity_thread_clz, currentApplicationId);
+                        if (application != nullptr) {
+                            ready = true;
+                            env->DeleteLocalRef(application);
+                        }
+                    }
+                    env->DeleteLocalRef(activity_thread_clz);
+                }
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                }
+                if (ready) {
+                    return vms;
+                }
+            }
+        }
+        usleep(100 * 1000);
+    }
+    LOGE("timed out waiting for runtime/application");
+    return nullptr;
+}
+
+bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
+    auto libart = dlopen("libart.so", RTLD_NOW);
+    if (!libart) {
+        LOGE("dlopen libart.so failed");
+        return false;
+    }
+    JavaVM *vms = WaitForRuntime(libart);
+    if (!vms) {
+        LOGE("runtime/application not ready");
         return false;
     }
 
@@ -155,9 +200,25 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
             LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
             LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
 
-            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
-            ftruncate(fd, (off_t) length);
+            int fd = (int) syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
+            if (fd == -1) {
+                LOGE("memfd_create failed");
+                munmap(data, length);
+                return false;
+            }
+            if (ftruncate(fd, (off_t) length) == -1) {
+                LOGE("ftruncate failed");
+                close(fd);
+                munmap(data, length);
+                return false;
+            }
             void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
+            if (mem == MAP_FAILED) {
+                LOGE("mmap memfd failed");
+                close(fd);
+                munmap(data, length);
+                return false;
+            }
             memcpy(mem, data, length);
             munmap(mem, length);
             munmap(data, length);
